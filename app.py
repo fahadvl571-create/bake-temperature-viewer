@@ -3,7 +3,6 @@ import time
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-from streamlit_autorefresh import st_autorefresh
 
 # ---------------------------
 # Page setup
@@ -22,6 +21,7 @@ def smooth_signal(series, window):
         .rolling(window=window, center=True, min_periods=1)
         .mean()
     )
+
 
 def clean_and_smooth(series, apply_smoothing, window):
     series = pd.to_numeric(series, errors="coerce")
@@ -48,6 +48,7 @@ def clean_and_smooth(series, apply_smoothing, window):
 
     return series
 
+
 # ---------------------------
 # CSV loader
 # ---------------------------
@@ -57,7 +58,7 @@ def read_instr_csv_from_bytes(file_bytes: bytes) -> pd.DataFrame:
         header=None,
         skiprows=26,
         encoding="utf-16",
-        sep="\t"
+        sep="\t",
     )
 
     df = df[0].str.split(",", expand=True)
@@ -70,24 +71,44 @@ def read_instr_csv_from_bytes(file_bytes: bytes) -> pd.DataFrame:
 
     return df
 
+
 def read_instr_csv_from_path(path: str) -> pd.DataFrame:
     with open(path, "rb") as f:
         file_bytes = f.read()
     return read_instr_csv_from_bytes(file_bytes)
 
+
 # ---------------------------
-# Auto-refresh controls
+# Sidebar: refresh + source
 # ---------------------------
 with st.sidebar:
     st.header("Live refresh")
     enable_refresh = st.checkbox("Auto-refresh", value=True)
-    refresh_seconds = st.number_input("Refresh interval (sec)", min_value=5, max_value=300, value=30, step=5)
+    refresh_seconds = st.number_input(
+        "Refresh interval (sec)",
+        min_value=5,
+        max_value=300,
+        value=30,
+        step=5,
+    )
 
-    # When enabled, this re-runs the script on a timer
+    # OPTION 1: Built-in refresh (no extra packages)
     if enable_refresh:
-        st_autorefresh(interval=int(refresh_seconds * 1000), key="auto_refresh")
+        st.markdown(
+            f"<meta http-equiv='refresh' content='{int(refresh_seconds)}'>",
+            unsafe_allow_html=True,
+        )
 
-st.caption("Tip: Use a fixed file path or upload once and let the app reuse it.")
+    st.divider()
+
+    st.header("Data source")
+    source_mode = st.radio(
+        "Choose source",
+        ["Upload once then auto-refresh", "Read from fixed path (server-side)"],
+        index=0,
+    )
+
+st.caption("Tip: On Streamlit Cloud, 'fixed path' means a path on the cloud server, not your local PC.")
 
 # ---------------------------
 # Choose data source
@@ -96,34 +117,34 @@ DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 DEFAULT_SAVED_PATH = os.path.join(DATA_DIR, "latest_instr.csv")
 
-source_mode = st.radio(
-    "Data source",
-    ["Read from fixed path (recommended for live)", "Upload once then auto-refresh"],
-    index=1
-)
-
 df = None
 status_line = None
 
-if source_mode == "Read from fixed path (recommended for live)":
-    fixed_path = st.text_input("CSV path (server-side path)", value=DEFAULT_SAVED_PATH)
+if source_mode == "Read from fixed path (server-side)":
+    fixed_path = st.text_input("CSV path (server-side)", value=DEFAULT_SAVED_PATH)
+
     if fixed_path and os.path.exists(fixed_path):
         df = read_instr_csv_from_path(fixed_path)
-        status_line = f"Reading: {fixed_path}  |  Last modified: {time.ctime(os.path.getmtime(fixed_path))}"
+        status_line = f"Reading: {fixed_path} | Last modified: {time.ctime(os.path.getmtime(fixed_path))}"
     else:
         st.warning("File not found at that path (on the server where Streamlit is running).")
+
 else:
     uploaded_file = st.file_uploader("Choose an INSTR CSV file (upload once)", type="csv")
+
     if uploaded_file is not None:
-        # Save it so future reruns can reuse it without re-upload
         file_bytes = uploaded_file.getvalue()
+
+        # Save it so reruns can reuse it without re-upload
         with open(DEFAULT_SAVED_PATH, "wb") as f:
             f.write(file_bytes)
+
         df = read_instr_csv_from_bytes(file_bytes)
         status_line = f"Uploaded & saved as: {DEFAULT_SAVED_PATH}"
+
     elif os.path.exists(DEFAULT_SAVED_PATH):
         df = read_instr_csv_from_path(DEFAULT_SAVED_PATH)
-        status_line = f"Using saved file: {DEFAULT_SAVED_PATH}  |  Last modified: {time.ctime(os.path.getmtime(DEFAULT_SAVED_PATH))}"
+        status_line = f"Using saved file: {DEFAULT_SAVED_PATH} | Last modified: {time.ctime(os.path.getmtime(DEFAULT_SAVED_PATH))}"
     else:
         st.info("Upload the file once. After that, auto-refresh will reuse the saved copy.")
 
@@ -141,10 +162,11 @@ temp_columns = [col for col in df.columns if col not in ["Scan", "Time"]]
 selected_sensors = st.multiselect(
     "Select thermocouples to plot",
     temp_columns,
-    default=temp_columns
+    default=temp_columns,
 )
 
 remove_outliers = st.checkbox("Remove outliers & negative values", value=True)
+
 smooth_noise = st.checkbox("Smooth / linearize signal (reduce TC noise)", value=True)
 
 window_size = st.slider(
@@ -152,7 +174,7 @@ window_size = st.slider(
     min_value=3,
     max_value=51,
     step=2,
-    value=11
+    value=11,
 )
 
 # Soak temperature window
@@ -171,22 +193,26 @@ for sensor in selected_sensors:
         plot_df[sensor] = clean_and_smooth(
             plot_df[sensor],
             apply_smoothing=smooth_noise,
-            window=window_size
+            window=window_size,
         )
 
 # ---------------------------
 # Calculate soak time
 # ---------------------------
 temp_only = plot_df[selected_sensors]
+
+# Condition: ALL sensors within range
 in_soak = temp_only.apply(lambda row: row.between(soak_low, soak_high).all(), axis=1)
 
+# Time delta between samples (seconds)
 time_delta = plot_df["Time"].diff().dt.total_seconds().fillna(0)
+
 soak_seconds = (time_delta * in_soak).sum()
 soak_hours = soak_seconds / 3600
 
 st.metric(
     label=f"Total time ALL TCs between {soak_low}–{soak_high} °C",
-    value=f"{soak_hours:.2f} hours"
+    value=f"{soak_hours:.2f} hours",
 )
 
 # ---------------------------
@@ -195,15 +221,23 @@ st.metric(
 fig = go.Figure()
 
 for sensor in selected_sensors:
-    fig.add_trace(go.Scatter(x=plot_df["Time"], y=plot_df[sensor], mode="lines", name=sensor))
+    fig.add_trace(
+        go.Scatter(
+            x=plot_df["Time"],
+            y=plot_df[sensor],
+            mode="lines",
+            name=sensor,
+        )
+    )
 
+# Soak lines
 fig.add_shape(
     type="line",
     x0=plot_df["Time"].min(),
     x1=plot_df["Time"].max(),
     y0=soak_low,
     y1=soak_low,
-    line=dict(color="green", dash="dot")
+    line=dict(color="green", dash="dot"),
 )
 
 fig.add_shape(
@@ -212,13 +246,13 @@ fig.add_shape(
     x1=plot_df["Time"].max(),
     y0=soak_high,
     y1=soak_high,
-    line=dict(color="green", dash="dot")
+    line=dict(color="green", dash="dot"),
 )
 
 fig.update_layout(
     title="Bake Temperature Profile",
     xaxis_title="Time",
-    yaxis_title="Temperature (°C)"
+    yaxis_title="Temperature (°C)",
 )
 
 st.plotly_chart(fig, use_container_width=True)
