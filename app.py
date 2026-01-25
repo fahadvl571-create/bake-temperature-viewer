@@ -10,6 +10,27 @@ st.title("Bake Temperature Viewer")
 # ---------------------------
 uploaded_file = st.file_uploader("Choose an INSTR CSV file", type="csv")
 
+def clean_outliers(series):
+    """
+    Remove extreme outliers using IQR and interpolate gaps.
+    """
+    series = pd.to_numeric(series, errors='coerce')
+
+    q1 = series.quantile(0.25)
+    q3 = series.quantile(0.75)
+    iqr = q3 - q1
+
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+
+    # Replace outliers with NaN
+    series = series.where((series >= lower) & (series <= upper))
+
+    # Smooth by interpolation
+    series = series.interpolate(method='linear', limit_direction='both')
+
+    return series
+
 if uploaded_file is not None:
     # Read CSV (skip first 26 rows)
     df = pd.read_csv(uploaded_file, header=None, skiprows=26, encoding="utf-16", sep="\t")
@@ -26,6 +47,11 @@ if uploaded_file is not None:
     
     if selected_sensors:
         plot_df = df[['Time'] + selected_sensors].copy()
+
+# Clean outliers per sensor
+        for sensor in selected_sensors:
+              plot_df[sensor] = clean_outliers(plot_df[sensor])
+
         plot_df_melted = plot_df.melt(id_vars='Time', var_name='Sensor', value_name='Temperature')
         plot_df_melted['Temperature'] = pd.to_numeric(plot_df_melted['Temperature'], errors='coerce')
 
@@ -78,6 +104,5 @@ if uploaded_file is not None:
             yaxis_title="Temperature (°C)",
             dragmode="drawline",  # allow line dragging
         )
-
 
         st.plotly_chart(fig, use_container_width=True)
