@@ -12,10 +12,6 @@ st.title("Bake Temperature Viewer")
 # Signal processing helpers
 # ---------------------------
 def smooth_signal(series, window):
-    """
-    Reduce thermocouple noise using
-    rolling median + rolling mean
-    """
     return (
         series
         .rolling(window=window, center=True, min_periods=1)
@@ -26,20 +22,12 @@ def smooth_signal(series, window):
 
 
 def clean_and_smooth(series, apply_smoothing, window):
-    """
-    Full TC conditioning pipeline:
-    1. Numeric conversion
-    2. Remove negative values
-    3. Remove statistical outliers (IQR)
-    4. Interpolate gaps
-    5. Smooth / linearize signal
-    """
     series = pd.to_numeric(series, errors="coerce")
 
-    # Hard physical rule: temperature cannot be negative
+    # Hard physical rule
     series = series.where(series >= 0)
 
-    # IQR-based outlier removal
+    # IQR outlier removal
     q1 = series.quantile(0.25)
     q3 = series.quantile(0.75)
     iqr = q3 - q1
@@ -49,10 +37,10 @@ def clean_and_smooth(series, apply_smoothing, window):
 
     series = series.where((series >= lower) & (series <= upper))
 
-    # Interpolate missing values
+    # Fill gaps
     series = series.interpolate(method="linear", limit_direction="both")
 
-    # Noise smoothing / linearization
+    # Smooth noise
     if apply_smoothing:
         series = smooth_signal(series, window)
 
@@ -64,7 +52,6 @@ def clean_and_smooth(series, apply_smoothing, window):
 uploaded_file = st.file_uploader("Choose an INSTR CSV file", type="csv")
 
 if uploaded_file is not None:
-    # Read CSV (skip first 26 rows)
     df = pd.read_csv(
         uploaded_file,
         header=None,
@@ -76,11 +63,8 @@ if uploaded_file is not None:
     df = df[0].str.split(",", expand=True)
     df.columns = df.iloc[0]
     df = df.iloc[1:].reset_index(drop=True)
-
-    # Remove alarm columns
     df = df.loc[:, ~df.columns.str.contains("Alarm")]
 
-    # Fix timestamp format
     df["Time"] = df["Time"].str.replace(r":(?=\d{3}$)", ".", regex=True)
     df["Time"] = pd.to_datetime(
         df["Time"],
@@ -113,17 +97,19 @@ if uploaded_file is not None:
         min_value=3,
         max_value=51,
         step=2,
-        value=11,
-        help="Larger window = smoother but slower response"
+        value=11
     )
+
+    # Soak temperature window
+    st.subheader("Soak condition")
+    soak_low = st.number_input("Lower soak limit (°C)", value=110.0)
+    soak_high = st.number_input("Upper soak limit (°C)", value=150.0)
 
     if selected_sensors:
         plot_df = df[["Time"] + selected_sensors].copy()
 
-        # Apply conditioning per sensor
         for sensor in selected_sensors:
             plot_df[sensor] = pd.to_numeric(plot_df[sensor], errors="coerce")
-
             if remove_outliers:
                 plot_df[sensor] = clean_and_smooth(
                     plot_df[sensor],
@@ -131,27 +117,31 @@ if uploaded_file is not None:
                     window=window_size
                 )
 
-        # Melt for limit initialization
-        plot_df_melted = plot_df.melt(
-            id_vars="Time",
-            var_name="Sensor",
-            value_name="Temperature"
+        # ---------------------------
+        # Calculate soak time
+        # ---------------------------
+        temp_only = plot_df[selected_sensors]
+
+        # Condition: ALL sensors within range
+        in_soak = temp_only.apply(
+            lambda row: row.between(soak_low, soak_high).all(),
+            axis=1
         )
 
-        min_temp = float(plot_df_melted["Temperature"].min())
-        max_temp = float(plot_df_melted["Temperature"].max())
+        # Time delta between samples (seconds)
+        time_delta = plot_df["Time"].diff().dt.total_seconds().fillna(0)
 
-        lower_limit = st.number_input(
-            "Initial Lower Limit",
-            value=min_temp
-        )
-        upper_limit = st.number_input(
-            "Initial Upper Limit",
-            value=max_temp
+        soak_seconds = (time_delta * in_soak).sum()
+        soak_hours = soak_seconds / 3600
+
+        # Display result
+        st.metric(
+            label=f"Total time ALL TCs between {soak_low}–{soak_high} °C",
+            value=f"{soak_hours:.2f} hours"
         )
 
         # ---------------------------
-        # Plotly figure
+        # Plot
         # ---------------------------
         fig = go.Figure()
 
@@ -165,33 +155,28 @@ if uploaded_file is not None:
                 )
             )
 
-        # Lower limit line
         fig.add_shape(
             type="line",
             x0=plot_df["Time"].min(),
             x1=plot_df["Time"].max(),
-            y0=lower_limit,
-            y1=lower_limit,
-            line=dict(color="red", width=2, dash="dash"),
-            editable=True
+            y0=soak_low,
+            y1=soak_low,
+            line=dict(color="green", dash="dot")
         )
 
-        # Upper limit line
         fig.add_shape(
             type="line",
             x0=plot_df["Time"].min(),
             x1=plot_df["Time"].max(),
-            y0=upper_limit,
-            y1=upper_limit,
-            line=dict(color="red", width=2, dash="dash"),
-            editable=True
+            y0=soak_high,
+            y1=soak_high,
+            line=dict(color="green", dash="dot")
         )
 
         fig.update_layout(
             title="Bake Temperature Profile",
             xaxis_title="Time",
-            yaxis_title="Temperature (°C)",
-            dragmode="drawline"
+            yaxis_title="Temperature (°C)"
         )
 
         st.plotly_chart(fig, use_container_width=True)
