@@ -9,21 +9,37 @@ st.set_page_config(page_title="Bake Temperature Viewer", layout="wide")
 st.title("Bake Temperature Viewer")
 
 # ---------------------------
-# Helper function
+# Signal processing helpers
 # ---------------------------
-def clean_outliers(series):
+def smooth_signal(series, window):
     """
-    1. Convert to numeric
-    2. Treat ALL negative values as invalid
-    3. Remove statistical outliers using IQR
-    4. Interpolate to smooth the signal
+    Reduce thermocouple noise using
+    rolling median + rolling mean
+    """
+    return (
+        series
+        .rolling(window=window, center=True, min_periods=1)
+        .median()
+        .rolling(window=window, center=True, min_periods=1)
+        .mean()
+    )
+
+
+def clean_and_smooth(series, apply_smoothing, window):
+    """
+    Full TC conditioning pipeline:
+    1. Numeric conversion
+    2. Remove negative values
+    3. Remove statistical outliers (IQR)
+    4. Interpolate gaps
+    5. Smooth / linearize signal
     """
     series = pd.to_numeric(series, errors="coerce")
 
     # Hard physical rule: temperature cannot be negative
     series = series.where(series >= 0)
 
-    # IQR-based outlier detection
+    # IQR-based outlier removal
     q1 = series.quantile(0.25)
     q3 = series.quantile(0.75)
     iqr = q3 - q1
@@ -31,11 +47,14 @@ def clean_outliers(series):
     lower = q1 - 1.5 * iqr
     upper = q3 + 1.5 * iqr
 
-    # Replace outliers with NaN
     series = series.where((series >= lower) & (series <= upper))
 
-    # Interpolate missing points for smooth plot
+    # Interpolate missing values
     series = series.interpolate(method="linear", limit_direction="both")
+
+    # Noise smoothing / linearization
+    if apply_smoothing:
+        series = smooth_signal(series, window)
 
     return series
 
@@ -61,7 +80,7 @@ if uploaded_file is not None:
     # Remove alarm columns
     df = df.loc[:, ~df.columns.str.contains("Alarm")]
 
-    # Fix timestamp formatting
+    # Fix timestamp format
     df["Time"] = df["Time"].str.replace(r":(?=\d{3}$)", ".", regex=True)
     df["Time"] = pd.to_datetime(
         df["Time"],
@@ -80,20 +99,39 @@ if uploaded_file is not None:
     )
 
     remove_outliers = st.checkbox(
-        "Remove outliers & negative values (recommended)",
+        "Remove outliers & negative values",
         value=True
+    )
+
+    smooth_noise = st.checkbox(
+        "Smooth / linearize signal (reduce TC noise)",
+        value=True
+    )
+
+    window_size = st.slider(
+        "Smoothing window (samples)",
+        min_value=3,
+        max_value=51,
+        step=2,
+        value=11,
+        help="Larger window = smoother but slower response"
     )
 
     if selected_sensors:
         plot_df = df[["Time"] + selected_sensors].copy()
 
-        # Clean data per sensor if enabled
+        # Apply conditioning per sensor
         for sensor in selected_sensors:
             plot_df[sensor] = pd.to_numeric(plot_df[sensor], errors="coerce")
-            if remove_outliers:
-                plot_df[sensor] = clean_outliers(plot_df[sensor])
 
-        # For limit initialization
+            if remove_outliers:
+                plot_df[sensor] = clean_and_smooth(
+                    plot_df[sensor],
+                    apply_smoothing=smooth_noise,
+                    window=window_size
+                )
+
+        # Melt for limit initialization
         plot_df_melted = plot_df.melt(
             id_vars="Time",
             var_name="Sensor",
