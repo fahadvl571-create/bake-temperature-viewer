@@ -1,5 +1,6 @@
 import os
 import time
+import numpy as np
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -76,6 +77,62 @@ def read_instr_csv_from_path(path: str) -> pd.DataFrame:
     with open(path, "rb") as f:
         file_bytes = f.read()
     return read_instr_csv_from_bytes(file_bytes)
+
+
+# ---------------------------
+# Projection helper
+# ---------------------------
+def estimate_crossing_time(time_series: pd.Series, temp_series: pd.Series, target_c: float, lookback_samples: int = 30):
+    """
+    Estimate when temp crosses target using a linear fit over the most recent samples.
+    Returns: (t_cross: pd.Timestamp or None, slope_c_per_sec: float or None)
+    """
+    ts = pd.to_datetime(time_series)
+    ys = pd.to_numeric(temp_series, errors="coerce")
+
+    mask = ts.notna() & ys.notna()
+    ts = ts[mask]
+    ys = ys[mask]
+
+    if len(ts) < 5:
+        return None, None
+
+    # If already above target at last point, crossing is now
+    if ys.iloc[-1] >= target_c:
+        return ts.iloc[-1], 0.0
+
+    # Take recent window
+    ts_win = ts.iloc[-lookback_samples:]
+    ys_win = ys.iloc[-lookback_samples:]
+
+    if len(ts_win) < 5:
+        return None, None
+
+    # Convert time to seconds relative to start of window
+    t0 = ts_win.iloc[0]
+    x = (ts_win - t0).dt.total_seconds().to_numpy(dtype=float)
+    y = ys_win.to_numpy(dtype=float)
+
+    # If time isn't increasing, bail
+    if np.allclose(x.max(), 0):
+        return None, None
+
+    # Linear fit: y = m*x + b
+    m, b = np.polyfit(x, y, 1)
+
+    # Need a positive slope to project forward
+    if m <= 1e-9:
+        return None, m
+
+    # Solve for x when y = target
+    x_cross = (target_c - b) / m
+    if x_cross < 0:
+        # Would imply it crossed before the window, but last point is below target;
+        # treat as not reliably projectable.
+        return None, m
+
+    t_cross = t0 + pd.to_timedelta(float(x_cross), unit="s")
+    return t_cross, m
 
 
 # ---------------------------
@@ -166,7 +223,6 @@ selected_sensors = st.multiselect(
 )
 
 remove_outliers = st.checkbox("Remove outliers & negative values", value=True)
-
 smooth_noise = st.checkbox("Smooth / linearize signal (reduce TC noise)", value=True)
 
 window_size = st.slider(
@@ -181,6 +237,10 @@ window_size = st.slider(
 st.subheader("Soak condition")
 soak_low = st.number_input("Lower soak limit (°C)", value=110.0)
 soak_high = st.number_input("Upper soak limit (°C)", value=150.0)
+
+# Projection tuning
+st.subheader("Ramp-up / projection settings")
+lookback_samples = st.slider("Projection lookback (samples)", min_value=10, max_value=120, value=30, step=5)
 
 if not selected_sensors:
     st.stop()
@@ -197,23 +257,111 @@ for sensor in selected_sensors:
         )
 
 # ---------------------------
-# Calculate soak time
+# Ramp-up time: time for ALL TCs to reach 110C (soak_low)
 # ---------------------------
 temp_only = plot_df[selected_sensors]
 
-# Condition: ALL sensors within range
-in_soak = temp_only.apply(lambda row: row.between(soak_low, soak_high).all(), axis=1)
+# First time ALL sensors are >= soak_low
+all_reached_mask = temp_only.apply(lambda row: row.ge(soak_low).all(), axis=1)
 
-# Time delta between samples (seconds)
+t_start = plot_df["Time"].iloc[0]
+t_last = plot_df["Time"].iloc[-1]
+
+t_all_reached = None
+if all_reached_mask.any():
+    first_idx = all_reached_mask.idxmax()  # first True index
+    t_all_reached = plot_df.loc[first_idx, "Time"]
+
+ramp_up_seconds = None
+if t_all_reached is not None and pd.notna(t_all_reached) and pd.notna(t_start):
+    ramp_up_seconds = (t_all_reached - t_start).total_seconds()
+
+# ---------------------------
+# Projection time left for ALL TCs to reach 110C (if not reached yet)
+# ---------------------------
+projected_t_all = None
+projection_note = None
+
+if t_all_reached is None:
+    per_sensor_cross = []
+    bad_sensors = []
+
+    for sensor in selected_sensors:
+        t_cross, slope = estimate_crossing_time(
+            plot_df["Time"],
+            plot_df[sensor],
+            target_c=soak_low,
+            lookback_samples=int(lookback_samples),
+        )
+
+        if t_cross is None:
+            bad_sensors.append(sensor)
+        else:
+            per_sensor_cross.append(t_cross)
+
+    if per_sensor_cross:
+        projected_t_all = max(per_sensor_cross)  # slowest sensor dominates
+    else:
+        projected_t_all = None
+
+    if bad_sensors:
+        projection_note = f"Projection unavailable for: {', '.join(bad_sensors)} (not enough data or not heating up)."
+
+# ---------------------------
+# Calculate soak time (ALL sensors within soak window)
+# ---------------------------
+in_soak = temp_only.apply(lambda row: row.between(soak_low, soak_high).all(), axis=1)
 time_delta = plot_df["Time"].diff().dt.total_seconds().fillna(0)
 
 soak_seconds = (time_delta * in_soak).sum()
 soak_hours = soak_seconds / 3600
 
-st.metric(
-    label=f"Total time ALL TCs between {soak_low}–{soak_high} °C",
-    value=f"{soak_hours:.2f} hours",
-)
+# ---------------------------
+# Display metrics
+# ---------------------------
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    if ramp_up_seconds is None:
+        st.metric(
+            label=f"Ramp-Up time (ALL TCs to ≥ {soak_low:.0f}°C)",
+            value="Not reached yet",
+        )
+    else:
+        st.metric(
+            label=f"Ramp-Up time (ALL TCs to ≥ {soak_low:.0f}°C)",
+            value=f"{ramp_up_seconds/3600:.2f} hours",
+        )
+
+with col2:
+    if t_all_reached is not None:
+        st.metric(
+            label=f"Projection left to ALL reach {soak_low:.0f}°C",
+            value="0.00 hours",
+        )
+    else:
+        if projected_t_all is None or pd.isna(projected_t_all):
+            st.metric(
+                label=f"Projection left to ALL reach {soak_low:.0f}°C",
+                value="N/A",
+            )
+        else:
+            seconds_left = (projected_t_all - t_last).total_seconds()
+            if seconds_left < 0:
+                seconds_left = 0
+            st.metric(
+                label=f"Projection left to ALL reach {soak_low:.0f}°C",
+                value=f"{seconds_left/3600:.2f} hours",
+            )
+
+with col3:
+    st.metric(
+        label=f"Total time ALL TCs between {soak_low:.0f}–{soak_high:.0f} °C",
+        value=f"{soak_hours:.2f} hours",
+    )
+
+if projection_note:
+    st.info(projection_note)
 
 # ---------------------------
 # Plot
@@ -249,6 +397,17 @@ fig.add_shape(
     line=dict(color="green", dash="dot"),
 )
 
+# Optional: add a vertical line when ALL reached soak_low
+if t_all_reached is not None:
+    fig.add_shape(
+        type="line",
+        x0=t_all_reached,
+        x1=t_all_reached,
+        y0=float(np.nanmin(temp_only.to_numpy(dtype=float))),
+        y1=float(np.nanmax(temp_only.to_numpy(dtype=float))),
+        line=dict(color="black", dash="dash"),
+    )
+
 fig.update_layout(
     title="Bake Temperature Profile",
     xaxis_title="Time",
@@ -256,4 +415,3 @@ fig.update_layout(
 )
 
 st.plotly_chart(fig, use_container_width=True)
-
