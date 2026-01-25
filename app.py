@@ -79,4 +79,5 @@ if uploaded_file is not None:
             dragmode="drawline",  # allow line dragging
         )
 
+
         st.plotly_chart(fig, use_container_width=True)
