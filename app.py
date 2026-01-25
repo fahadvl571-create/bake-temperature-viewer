@@ -88,7 +88,7 @@ with st.sidebar:
         "Refresh interval (sec)",
         min_value=5,
         max_value=300,
-        value=30,
+        value=180,
         step=5,
     )
 
@@ -256,3 +256,4 @@ fig.update_layout(
 )
 
 st.plotly_chart(fig, use_container_width=True)
+
