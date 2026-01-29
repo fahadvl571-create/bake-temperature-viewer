@@ -129,7 +129,7 @@ def estimate_crossing_time(time_series: pd.Series, temp_series: pd.Series, targe
     return t_cross, m
 
 # ---------------------------
-# Small helper: group sensors by name
+# Grouping helpers
 # ---------------------------
 def group_sensors(sensors):
     te = [s for s in sensors if "TE" in str(s)]
@@ -138,10 +138,78 @@ def group_sensors(sensors):
     other = [s for s in sensors if s not in set(te + ce + mid)]
     return te, ce, mid, other
 
-# ---------------------------
-# Small helper: make a plotly figure for a sensor group
-# ---------------------------
-def build_group_figure(plot_df, sensors, title, soak_low, soak_high, t_all_reached=None):
+def compute_group_ramp_and_projection(plot_df: pd.DataFrame, sensors: list, target_c: float, lookback_samples: int):
+    """
+    For a given sensor group:
+      - ramp time: first time ALL sensors in group >= target
+      - projection: time left until ALL sensors in group reach target (if not reached)
+    Returns:
+      dict with keys:
+        t_reached, ramp_seconds, projected_t_all, seconds_left, note
+    """
+    out = {
+        "t_reached": None,
+        "ramp_seconds": None,
+        "projected_t_all": None,
+        "seconds_left": None,
+        "note": None,
+    }
+
+    if not sensors:
+        out["note"] = "No sensors in this group."
+        return out
+
+    temp_only = plot_df[sensors]
+
+    # First time ALL in group >= target
+    reached_mask = temp_only.apply(lambda row: row.ge(target_c).all(), axis=1)
+
+    t_start = plot_df["Time"].iloc[0]
+    t_last = plot_df["Time"].iloc[-1]
+
+    if reached_mask.any():
+        first_idx = reached_mask.idxmax()
+        t_reached = plot_df.loc[first_idx, "Time"]
+        out["t_reached"] = t_reached
+        if pd.notna(t_reached) and pd.notna(t_start):
+            out["ramp_seconds"] = (t_reached - t_start).total_seconds()
+        out["projected_t_all"] = t_last
+        out["seconds_left"] = 0.0
+        return out
+
+    # Not reached yet => project per sensor
+    per_sensor_cross = []
+    bad_sensors = []
+
+    for s in sensors:
+        t_cross, slope = estimate_crossing_time(
+            plot_df["Time"],
+            plot_df[s],
+            target_c=target_c,
+            lookback_samples=int(lookback_samples),
+        )
+        if t_cross is None:
+            bad_sensors.append(s)
+        else:
+            per_sensor_cross.append(t_cross)
+
+    if per_sensor_cross:
+        projected_t_all = max(per_sensor_cross)  # slowest dominates
+        out["projected_t_all"] = projected_t_all
+        seconds_left = (projected_t_all - t_last).total_seconds()
+        if seconds_left < 0:
+            seconds_left = 0
+        out["seconds_left"] = seconds_left
+    else:
+        out["projected_t_all"] = None
+        out["seconds_left"] = None
+
+    if bad_sensors:
+        out["note"] = f"Projection unavailable for: {', '.join(bad_sensors)} (not enough data or not heating up)."
+
+    return out
+
+def build_group_figure(plot_df, sensors, title, soak_low, soak_high, t_reached=None):
     fig = go.Figure()
 
     if not sensors:
@@ -171,7 +239,6 @@ def build_group_figure(plot_df, sensors, title, soak_low, soak_high, t_all_reach
         y1=soak_low,
         line=dict(color="green", dash="dot"),
     )
-
     fig.add_shape(
         type="line",
         x0=plot_df["Time"].min(),
@@ -181,12 +248,12 @@ def build_group_figure(plot_df, sensors, title, soak_low, soak_high, t_all_reach
         line=dict(color="green", dash="dot"),
     )
 
-    # Optional: add a vertical line when ALL reached soak_low
-    if t_all_reached is not None and pd.notna(t_all_reached):
+    # Optional: vertical line when group reached soak_low
+    if t_reached is not None and pd.notna(t_reached):
         fig.add_shape(
             type="line",
-            x0=t_all_reached,
-            x1=t_all_reached,
+            x0=t_reached,
+            x1=t_reached,
             y0=float(np.nanmin(plot_df[sensors].to_numpy(dtype=float))),
             y1=float(np.nanmax(plot_df[sensors].to_numpy(dtype=float))),
             line=dict(color="black", dash="dash"),
@@ -213,7 +280,6 @@ with st.sidebar:
         step=5,
     )
 
-    # OPTION 1: Built-in refresh (no extra packages)
     if enable_refresh:
         st.markdown(
             f"<meta http-equiv='refresh' content='{int(refresh_seconds)}'>",
@@ -256,7 +322,6 @@ else:
     if uploaded_file is not None:
         file_bytes = uploaded_file.getvalue()
 
-        # Save it so reruns can reuse it without re-upload
         with open(DEFAULT_SAVED_PATH, "wb") as f:
             f.write(file_bytes)
 
@@ -297,12 +362,10 @@ window_size = st.slider(
     value=11,
 )
 
-# Soak temperature window
 st.subheader("Soak condition")
 soak_low = st.number_input("Lower soak limit (°C)", value=110.0)
 soak_high = st.number_input("Upper soak limit (°C)", value=150.0)
 
-# Projection tuning
 st.subheader("Ramp-up / projection settings")
 lookback_samples = st.slider("Projection lookback (samples)", min_value=10, max_value=120, value=30, step=5)
 
@@ -321,28 +384,23 @@ for sensor in selected_sensors:
         )
 
 # ---------------------------
-# Ramp-up time: time for ALL TCs to reach 110C (soak_low)
+# Overall metrics (ALL selected sensors) - same as before
 # ---------------------------
-temp_only = plot_df[selected_sensors]
-
-# First time ALL sensors are >= soak_low
-all_reached_mask = temp_only.apply(lambda row: row.ge(soak_low).all(), axis=1)
+temp_only_all = plot_df[selected_sensors]
+all_reached_mask = temp_only_all.apply(lambda row: row.ge(soak_low).all(), axis=1)
 
 t_start = plot_df["Time"].iloc[0]
 t_last = plot_df["Time"].iloc[-1]
 
 t_all_reached = None
 if all_reached_mask.any():
-    first_idx = all_reached_mask.idxmax()  # first True index
+    first_idx = all_reached_mask.idxmax()
     t_all_reached = plot_df.loc[first_idx, "Time"]
 
 ramp_up_seconds = None
 if t_all_reached is not None and pd.notna(t_all_reached) and pd.notna(t_start):
     ramp_up_seconds = (t_all_reached - t_start).total_seconds()
 
-# ---------------------------
-# Projection time left for ALL TCs to reach 110C (if not reached yet)
-# ---------------------------
 projected_t_all = None
 projection_note = None
 
@@ -357,32 +415,25 @@ if t_all_reached is None:
             target_c=soak_low,
             lookback_samples=int(lookback_samples),
         )
-
         if t_cross is None:
             bad_sensors.append(sensor)
         else:
             per_sensor_cross.append(t_cross)
 
     if per_sensor_cross:
-        projected_t_all = max(per_sensor_cross)  # slowest sensor dominates
+        projected_t_all = max(per_sensor_cross)
     else:
         projected_t_all = None
 
     if bad_sensors:
         projection_note = f"Projection unavailable for: {', '.join(bad_sensors)} (not enough data or not heating up)."
 
-# ---------------------------
-# Calculate soak time (ALL sensors within soak window)
-# ---------------------------
-in_soak = temp_only.apply(lambda row: row.between(soak_low, soak_high).all(), axis=1)
+# Soak time (ALL sensors)
+in_soak = temp_only_all.apply(lambda row: row.between(soak_low, soak_high).all(), axis=1)
 time_delta = plot_df["Time"].diff().dt.total_seconds().fillna(0)
-
 soak_seconds = (time_delta * in_soak).sum()
 soak_hours = soak_seconds / 3600
 
-# ---------------------------
-# Display metrics
-# ---------------------------
 col1, col2, col3 = st.columns(3)
 
 with col1:
@@ -428,21 +479,63 @@ if projection_note:
     st.info(projection_note)
 
 # ---------------------------
-# Split charts by TE / CE / Mid
+# Tabs: TE / CE / Mid with per-tab projection
 # ---------------------------
 te_sensors, ce_sensors, mid_sensors, other_sensors = group_sensors(selected_sensors)
 
-st.subheader("Bake Temperature Profile (split by sensor group)")
-
-# If you want: show unmatched sensors so you don't “lose” them silently
 if other_sensors:
     st.warning("Unmatched sensors (not containing TE/CE/Mid): " + ", ".join(other_sensors))
 
-fig_te = build_group_figure(plot_df, te_sensors, "TE Thermocouples", soak_low, soak_high, t_all_reached=t_all_reached)
-fig_ce = build_group_figure(plot_df, ce_sensors, "CE Thermocouples", soak_low, soak_high, t_all_reached=t_all_reached)
-fig_mid = build_group_figure(plot_df, mid_sensors, "Mid Thermocouples", soak_low, soak_high, t_all_reached=t_all_reached)
+tab_te, tab_ce, tab_mid = st.tabs(["TE", "CE", "Mid"])
 
-# Layout: 3 charts stacked
-st.plotly_chart(fig_te, use_container_width=True)
-st.plotly_chart(fig_ce, use_container_width=True)
-st.plotly_chart(fig_mid, use_container_width=True)
+def render_group_tab(tab, group_name, sensors):
+    with tab:
+        st.subheader(f"{group_name} sensors")
+
+        group_stats = compute_group_ramp_and_projection(
+            plot_df=plot_df,
+            sensors=sensors,
+            target_c=float(soak_low),
+            lookback_samples=int(lookback_samples),
+        )
+
+        m1, m2 = st.columns(2)
+
+        with m1:
+            if not sensors:
+                st.metric(f"{group_name} Ramp-Up (ALL to ≥ {soak_low:.0f}°C)", "N/A")
+            elif group_stats["ramp_seconds"] is None:
+                st.metric(f"{group_name} Ramp-Up (ALL to ≥ {soak_low:.0f}°C)", "Not reached yet")
+            else:
+                st.metric(
+                    f"{group_name} Ramp-Up (ALL to ≥ {soak_low:.0f}°C)",
+                    f"{group_stats['ramp_seconds']/3600:.2f} hours",
+                )
+
+        with m2:
+            if not sensors:
+                st.metric(f"{group_name} Projection left (ALL to {soak_low:.0f}°C)", "N/A")
+            elif group_stats["seconds_left"] is None:
+                st.metric(f"{group_name} Projection left (ALL to {soak_low:.0f}°C)", "N/A")
+            else:
+                st.metric(
+                    f"{group_name} Projection left (ALL to {soak_low:.0f}°C)",
+                    f"{group_stats['seconds_left']/3600:.2f} hours",
+                )
+
+        if group_stats["note"]:
+            st.info(group_stats["note"])
+
+        fig = build_group_figure(
+            plot_df=plot_df,
+            sensors=sensors,
+            title=f"{group_name} Thermocouples",
+            soak_low=float(soak_low),
+            soak_high=float(soak_high),
+            t_reached=group_stats["t_reached"],
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+render_group_tab(tab_te, "TE", te_sensors)
+render_group_tab(tab_ce, "CE", ce_sensors)
+render_group_tab(tab_mid, "Mid", mid_sensors)
