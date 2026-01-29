@@ -23,7 +23,6 @@ def smooth_signal(series, window):
         .mean()
     )
 
-
 def clean_and_smooth(series, apply_smoothing, window):
     series = pd.to_numeric(series, errors="coerce")
 
@@ -49,7 +48,6 @@ def clean_and_smooth(series, apply_smoothing, window):
 
     return series
 
-
 # ---------------------------
 # CSV loader
 # ---------------------------
@@ -72,12 +70,10 @@ def read_instr_csv_from_bytes(file_bytes: bytes) -> pd.DataFrame:
 
     return df
 
-
 def read_instr_csv_from_path(path: str) -> pd.DataFrame:
     with open(path, "rb") as f:
         file_bytes = f.read()
     return read_instr_csv_from_bytes(file_bytes)
-
 
 # ---------------------------
 # Projection helper
@@ -127,13 +123,81 @@ def estimate_crossing_time(time_series: pd.Series, temp_series: pd.Series, targe
     # Solve for x when y = target
     x_cross = (target_c - b) / m
     if x_cross < 0:
-        # Would imply it crossed before the window, but last point is below target;
-        # treat as not reliably projectable.
         return None, m
 
     t_cross = t0 + pd.to_timedelta(float(x_cross), unit="s")
     return t_cross, m
 
+# ---------------------------
+# Small helper: group sensors by name
+# ---------------------------
+def group_sensors(sensors):
+    te = [s for s in sensors if "TE" in str(s)]
+    ce = [s for s in sensors if "CE" in str(s)]
+    mid = [s for s in sensors if "Mid" in str(s)]
+    other = [s for s in sensors if s not in set(te + ce + mid)]
+    return te, ce, mid, other
+
+# ---------------------------
+# Small helper: make a plotly figure for a sensor group
+# ---------------------------
+def build_group_figure(plot_df, sensors, title, soak_low, soak_high, t_all_reached=None):
+    fig = go.Figure()
+
+    if not sensors:
+        fig.update_layout(
+            title=f"{title} (no matching sensors selected)",
+            xaxis_title="Time",
+            yaxis_title="Temperature (°C)",
+        )
+        return fig
+
+    for sensor in sensors:
+        fig.add_trace(
+            go.Scatter(
+                x=plot_df["Time"],
+                y=plot_df[sensor],
+                mode="lines",
+                name=sensor,
+            )
+        )
+
+    # Soak lines
+    fig.add_shape(
+        type="line",
+        x0=plot_df["Time"].min(),
+        x1=plot_df["Time"].max(),
+        y0=soak_low,
+        y1=soak_low,
+        line=dict(color="green", dash="dot"),
+    )
+
+    fig.add_shape(
+        type="line",
+        x0=plot_df["Time"].min(),
+        x1=plot_df["Time"].max(),
+        y0=soak_high,
+        y1=soak_high,
+        line=dict(color="green", dash="dot"),
+    )
+
+    # Optional: add a vertical line when ALL reached soak_low
+    if t_all_reached is not None and pd.notna(t_all_reached):
+        fig.add_shape(
+            type="line",
+            x0=t_all_reached,
+            x1=t_all_reached,
+            y0=float(np.nanmin(plot_df[sensors].to_numpy(dtype=float))),
+            y1=float(np.nanmax(plot_df[sensors].to_numpy(dtype=float))),
+            line=dict(color="black", dash="dash"),
+        )
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="Time",
+        yaxis_title="Temperature (°C)",
+    )
+    return fig
 
 # ---------------------------
 # Sidebar: refresh + source
@@ -364,54 +428,21 @@ if projection_note:
     st.info(projection_note)
 
 # ---------------------------
-# Plot
+# Split charts by TE / CE / Mid
 # ---------------------------
-fig = go.Figure()
+te_sensors, ce_sensors, mid_sensors, other_sensors = group_sensors(selected_sensors)
 
-for sensor in selected_sensors:
-    fig.add_trace(
-        go.Scatter(
-            x=plot_df["Time"],
-            y=plot_df[sensor],
-            mode="lines",
-            name=sensor,
-        )
-    )
+st.subheader("Bake Temperature Profile (split by sensor group)")
 
-# Soak lines
-fig.add_shape(
-    type="line",
-    x0=plot_df["Time"].min(),
-    x1=plot_df["Time"].max(),
-    y0=soak_low,
-    y1=soak_low,
-    line=dict(color="green", dash="dot"),
-)
+# If you want: show unmatched sensors so you don't “lose” them silently
+if other_sensors:
+    st.warning("Unmatched sensors (not containing TE/CE/Mid): " + ", ".join(other_sensors))
 
-fig.add_shape(
-    type="line",
-    x0=plot_df["Time"].min(),
-    x1=plot_df["Time"].max(),
-    y0=soak_high,
-    y1=soak_high,
-    line=dict(color="green", dash="dot"),
-)
+fig_te = build_group_figure(plot_df, te_sensors, "TE Thermocouples", soak_low, soak_high, t_all_reached=t_all_reached)
+fig_ce = build_group_figure(plot_df, ce_sensors, "CE Thermocouples", soak_low, soak_high, t_all_reached=t_all_reached)
+fig_mid = build_group_figure(plot_df, mid_sensors, "Mid Thermocouples", soak_low, soak_high, t_all_reached=t_all_reached)
 
-# Optional: add a vertical line when ALL reached soak_low
-if t_all_reached is not None:
-    fig.add_shape(
-        type="line",
-        x0=t_all_reached,
-        x1=t_all_reached,
-        y0=float(np.nanmin(temp_only.to_numpy(dtype=float))),
-        y1=float(np.nanmax(temp_only.to_numpy(dtype=float))),
-        line=dict(color="black", dash="dash"),
-    )
-
-fig.update_layout(
-    title="Bake Temperature Profile",
-    xaxis_title="Time",
-    yaxis_title="Temperature (°C)",
-)
-
-st.plotly_chart(fig, use_container_width=True)
+# Layout: 3 charts stacked
+st.plotly_chart(fig_te, use_container_width=True)
+st.plotly_chart(fig_ce, use_container_width=True)
+st.plotly_chart(fig_mid, use_container_width=True)
