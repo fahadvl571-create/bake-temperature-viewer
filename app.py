@@ -364,7 +364,7 @@ window_size = st.slider(
 
 st.subheader("Soak condition")
 soak_low = st.number_input("Lower soak limit (°C)", value=110.0)
-soak_high = st.number_input("Upper soak limit (°C)", value=150.0)
+soak_high = st.number_input("Upper soak limit (°C)", value=190.0)
 
 st.subheader("Ramp-up / projection settings")
 lookback_samples = st.slider("Projection lookback (samples)", min_value=10, max_value=120, value=30, step=5)
@@ -539,3 +539,4 @@ def render_group_tab(tab, group_name, sensors):
 render_group_tab(tab_te, "TE", te_sensors)
 render_group_tab(tab_ce, "CE", ce_sensors)
 render_group_tab(tab_mid, "Mid", mid_sensors)
+
